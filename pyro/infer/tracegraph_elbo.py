@@ -97,7 +97,7 @@ def _construct_baseline(node, guide_site, downstream_cost):
     return use_baseline, baseline_loss, baseline
 
 
-def _compute_downstream_costs(model_trace, guide_trace, non_reparam_nodes):  #
+def _compute_downstream_costs(model_trace, guide_trace, non_reparam_nodes, aux_vars=set()):  #
     # recursively compute downstream cost nodes for all sample sites in model and guide
     # (even though ultimately just need for non-reparameterizable sample sites)
     # 1. downstream costs used for rao-blackwellization
@@ -105,7 +105,7 @@ def _compute_downstream_costs(model_trace, guide_trace, non_reparam_nodes):  #
     # dependency structures) are taken care of via 'children_in_model' below
     topo_sort_guide_nodes = guide_trace.topological_sort(reverse=True)
     topo_sort_guide_nodes = [
-        x for x in topo_sort_guide_nodes if guide_trace.nodes[x]["type"] == "sample"
+        x for x in topo_sort_guide_nodes if guide_trace.nodes[x]["type"] == "sample" if x not in aux_vars
     ]
     ordered_guide_nodes_dict = {n: i for i, n in enumerate(topo_sort_guide_nodes)}
 
@@ -125,7 +125,7 @@ def _compute_downstream_costs(model_trace, guide_trace, non_reparam_nodes):  #
         downstream_guide_cost_nodes[node] = set([node])
         # make more efficient by ordering children appropriately (higher children first)
         children = [
-            (k, -ordered_guide_nodes_dict[k]) for k in guide_trace.successors(node)
+            (k, -ordered_guide_nodes_dict[k]) for k in guide_trace.successors(node) if k not in aux_vars
         ]
         sorted_children = sorted(children, key=itemgetter(1))
         for child, _ in sorted_children:
@@ -172,7 +172,7 @@ def _compute_downstream_costs(model_trace, guide_trace, non_reparam_nodes):  #
     return downstream_costs, downstream_guide_cost_nodes
 
 
-def _compute_elbo_reparam(model_trace, guide_trace):
+def _compute_elbo_reparam(model_trace, guide_trace, aux_vars=set()):
 
     # In ref [1], section 3.2, the part of the surrogate loss computed here is
     # \sum{cost}, which in this case is the ELBO. Instead of using the ELBO,
@@ -195,7 +195,7 @@ def _compute_elbo_reparam(model_trace, guide_trace):
     # the variance under some conditions, the default entropy terms from
     # site[`score_parts`] are used.
     for name, site in guide_trace.nodes.items():
-        if site["type"] == "sample":
+        if site["type"] == "sample" and name not in aux_vars:
             elbo -= site["log_prob_sum"]
             entropy_term = site["score_parts"].entropy_term
             # For fully reparameterized terms, this entropy_term is log q(z|...)
@@ -319,15 +319,24 @@ class TraceGraph_ELBO(ELBO):
 
     def _loss_and_surrogate_loss_particle(self, model_trace, guide_trace):
 
+        # collect set of auxiliary variables
+        aux_vars = set(
+            name
+            for name, site in guide_trace.nodes.items()
+            if site["type"] == "sample"
+            if site["infer"].get("is_auxiliary")
+        )
+
         # compute elbo for reparameterized nodes
-        elbo, surrogate_elbo = _compute_elbo_reparam(model_trace, guide_trace)
+        elbo, surrogate_elbo = _compute_elbo_reparam(model_trace, guide_trace,
+                                                     aux_vars=aux_vars)
         baseline_loss = 0.0
 
         # the following computations are only necessary if we have non-reparameterizable nodes
-        non_reparam_nodes = set(guide_trace.nonreparam_stochastic_nodes)
+        non_reparam_nodes = set(guide_trace.nonreparam_stochastic_nodes) - aux_vars
         if non_reparam_nodes:
             downstream_costs, _ = _compute_downstream_costs(
-                model_trace, guide_trace, non_reparam_nodes
+                model_trace, guide_trace, non_reparam_nodes, aux_vars=aux_vars
             )
             surrogate_elbo_term, baseline_loss = _compute_elbo_non_reparam(
                 guide_trace, non_reparam_nodes, downstream_costs
