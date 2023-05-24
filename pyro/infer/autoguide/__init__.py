@@ -5,7 +5,9 @@ from pyro.infer.autoguide.effect import (
     AutoHierarchicalNormalMessenger,
     AutoMessenger,
     AutoNormalMessenger,
+    AutoNeuralSviMessenger,
     AutoRegressiveMessenger,
+    AutoSviMessenger,
 )
 from pyro.infer.autoguide.gaussian import AutoGaussian
 from pyro.infer.autoguide.guides import (
@@ -53,8 +55,10 @@ __all__ = [
     "AutoNormalMessenger",
     "AutoHierarchicalNormalMessenger",
     "AutoNormalizingFlow",
+    "AutoNeuralSviMessenger",
     "AutoRegressiveMessenger",
     "AutoStructured",
+    "AutoSviMessenger",
     "init_to_feasible",
     "init_to_generated",
     "init_to_mean",
