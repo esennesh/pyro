@@ -13,8 +13,8 @@ from pyro.ops.tensor_utils import periodic_repeat
 from pyro.poutine.guide import GuideMessenger
 from pyro.poutine.runtime import get_plates
 
-from .initialization import init_to_feasible, init_to_mean
-from .utils import deep_getattr, deep_setattr, dist_params, helpful_support_errors
+from .initialization import init_to_feasible, init_to_mean, mlp_amortizer
+from .utils import deep_getattr, deep_setattr, dist_params, helpful_support_errors, _product
 
 
 class AutoMessengerMeta(type(GuideMessenger), type(PyroModule)):
@@ -504,3 +504,42 @@ class AutoSviMessenger(AutoMessenger):
         posterior = dist.TransformedDistribution(proposal,
                                                  [transform.with_cache()])
         return posterior
+
+class AutoNeuralSviMessenger(AutoSviMessenger):
+    def __init__(
+        self,
+        model: Callable,
+        event: torch.Tensor,
+        event_shape: torch.Size,
+        *,
+        init_amortizer: Callable = mlp_amortizer,
+        amortized_plates: Tuple[str, ...] = (),
+    ):
+        if not callable(init_amortizer):
+            raise ValueError("Expected callable to construct ASVI amortizers")
+        super().__init__(model, amortized_plates=amortized_plates)
+        self._event = event
+        self._event_shape = event_shape
+        self._init_amortizer = init_amortizer
+
+    def _get_params(self, name: str, prior: Distribution):
+        try:
+            prior_logits = deep_getattr(self.prior_logit_amortizer, name)(self._event).squeeze()
+            mean_fields = {k: deep_getattr(self.mean_field_amortizer, name + "." + k)(self._event)
+                           for k, v in dist_params(prior).items()}
+            return prior_logits, mean_fields
+        except AttributeError:
+            pass
+
+        # Initialize amortizer nets
+        event_dim_start = len(self._event.size()) - len(self._event_shape)
+        event_dim = _product(self._event.shape[event_dim_start:])
+        for k, v in dist_params(prior).items():
+            amortizer = self._init_amortizer(event_dim,
+                                             _product(v.shape[event_dim_start:]))
+            deep_setattr(self, "mean_field_amortizer." + name + "." + k,
+                         amortizer.to(device=v.device))
+        amortizer = self._init_amortizer(event_dim, 1)
+        deep_setattr(self, "prior_logit_amortizer." + name, amortizer.to(device=v.device))
+
+        return self._get_params(name, prior)
