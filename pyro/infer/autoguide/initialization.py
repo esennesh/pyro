@@ -254,3 +254,10 @@ class InitMessenger(Messenger):
         if msg["value"] is None:
             msg["value"] = []
         msg["value"].append(self)
+
+def mlp_amortizer(dom, cod):
+    return torch.nn.Sequential(
+        nn.Linear(dom, cod * 2),
+        nn.ReLU(),
+        nn.Linear(cod * 2, cod)
+    )
