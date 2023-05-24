@@ -4,7 +4,7 @@
 from typing import Callable, Optional, Tuple, Union
 
 import torch
-from torch.distributions import biject_to, constraints
+from torch.distributions import biject_to, constraints, transform_to
 
 import pyro.distributions as dist
 from pyro.distributions.distribution import Distribution
@@ -14,7 +14,7 @@ from pyro.poutine.guide import GuideMessenger
 from pyro.poutine.runtime import get_plates
 
 from .initialization import init_to_feasible, init_to_mean
-from .utils import deep_getattr, deep_setattr, helpful_support_errors
+from .utils import deep_getattr, deep_setattr, dist_params, helpful_support_errors
 
 
 class AutoMessengerMeta(type(GuideMessenger), type(PyroModule)):
@@ -452,3 +452,55 @@ class AutoRegressiveMessenger(AutoMessenger):
             PyroParam(init_scale, constraint=constraints.positive, event_dim=event_dim),
         )
         return self._get_params(name, prior)
+
+class AutoSviMessenger(AutoMessenger):
+    def _get_params(self, name: str, prior: Distribution):
+        try:
+            prior_logits = deep_getattr(self.prior_logits, name)
+            mean_fields = {deep_getattr(self.mean_fields, name + "." + k) for
+                           k, v in dist_params(prior).items()}
+            return prior_logits, mean_fields
+        except AttributeError:
+            pass
+
+        # Initialize
+        for k, v in dist_params(prior).items():
+            with torch.no_grad():
+                transform = biject_to(prior.support)
+                event_dim = transform.domain.event_dim
+                unconstrained = torch.zeros_like(v)
+                unconstrained = self._adjust_plates(unconstrained, event_dim)
+            deep_setattr(self, "mean_fields." + name + "." + k,
+                         PyroParam(unconstrained, event_dim=event_dim))
+        with torch.no_grad():
+            event_dim_start = len(v.size()) - len(prior.event_shape)
+            prior_logits = torch.zeros(v.shape[:event_dim_start], device=v.device)
+            prior_logits = self._adjust_plates(prior_logits, event_dim)
+        deep_setattr(self, "prior_logits." + name, PyroParam(prior_logits))
+
+        return self._get_params(name, prior)
+
+    def get_posterior(self, name: str, prior: Distribution) -> Distribution:
+        with helpful_support_errors({"name": name, "fn": prior}):
+            transform = biject_to(prior.support)
+            event_shape = prior.event_shape
+            if isinstance(prior, dist.Independent):
+                independent_ndims = prior.reinterpreted_batch_ndims
+                prior = prior.base_dist
+            else:
+                independent_ndims = 0
+            prior_params = dist_params(prior)
+        alphas, lamdas = self._get_params(name, prior)
+        alphas = torch.sigmoid(alphas)
+        alphas = alphas.reshape(alphas.shape + (1,) * len(event_shape))
+        for k, v in prior_params.items():
+            param_transform = transform_to(prior.arg_constraints[k])
+            lam = param_transform(lamdas[k])
+            prior_params[k] = alphas * v + (1 - alphas) * lam
+
+        proposal = prior.__class__(**prior_params)
+        if independent_ndims:
+            proposal = dist.Independent(proposal, independent_ndims)
+        posterior = dist.TransformedDistribution(proposal,
+                                                 [transform.with_cache()])
+        return posterior
