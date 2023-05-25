@@ -11,7 +11,7 @@ from pyro.distributions.distribution import Distribution
 from pyro.nn.module import PyroModule, PyroParam, pyro_method
 from pyro.ops.tensor_utils import periodic_repeat
 from pyro.poutine.guide import GuideMessenger
-from pyro.poutine.runtime import get_plates
+from pyro.poutine.runtime import get_conditions, get_plates
 
 from .initialization import init_to_feasible, init_to_mean, mlp_amortizer
 from .utils import deep_getattr, deep_setattr, dist_params, helpful_support_errors, _product
@@ -509,8 +509,8 @@ class AutoNeuralSviMessenger(AutoSviMessenger):
     def __init__(
         self,
         model: Callable,
-        event: torch.Tensor,
-        event_shape: torch.Size,
+        obs_name: str,
+        batch_shape: torch.Size,
         *,
         init_amortizer: Callable = mlp_amortizer,
         amortized_plates: Tuple[str, ...] = (),
@@ -518,28 +518,37 @@ class AutoNeuralSviMessenger(AutoSviMessenger):
         if not callable(init_amortizer):
             raise ValueError("Expected callable to construct ASVI amortizers")
         super().__init__(model, amortized_plates=amortized_plates)
-        self._event = event
-        self._event_shape = event_shape
+        self._obs_name = obs_name
+        self._batch_shape = batch_shape
         self._init_amortizer = init_amortizer
 
     def _get_params(self, name: str, prior: Distribution):
+        conditions = get_conditions()
+        data = {}
+        for condition in conditions:
+            data = data | condition
         try:
-            prior_logits = deep_getattr(self.prior_logit_amortizer, name)(self._event).squeeze()
-            mean_fields = {k: deep_getattr(self.mean_field_amortizer, name + "." + k)(self._event)
+            obs = data[self._obs_name]
+            event_dim = _product(obs.shape[len(self._batch_shape):])
+        except KeyError:
+            raise KeyError("Expected observation %s on which to condition amortized ASVI" % self._obs_name)
+
+        try:
+            obs = obs.view(*self._batch_shape, event_dim)
+            prior_logits = deep_getattr(self.prior_logits, name)(obs).squeeze()
+            mean_fields = {k: deep_getattr(self.mean_fields, name + "." + k)(obs)
                            for k, v in dist_params(prior).items()}
             return prior_logits, mean_fields
         except AttributeError:
             pass
 
         # Initialize amortizer nets
-        event_dim_start = len(self._event.size()) - len(self._event_shape)
-        event_dim = _product(self._event.shape[event_dim_start:])
         for k, v in dist_params(prior).items():
             amortizer = self._init_amortizer(event_dim,
-                                             _product(v.shape[event_dim_start:]))
-            deep_setattr(self, "mean_field_amortizer." + name + "." + k,
+                                             _product(v.shape[len(self._batch_shape):]))
+            deep_setattr(self, "mean_fields." + name + "." + k,
                          amortizer.to(device=v.device))
         amortizer = self._init_amortizer(event_dim, 1)
-        deep_setattr(self, "prior_logit_amortizer." + name, amortizer.to(device=v.device))
+        deep_setattr(self, "prior_logits." + name, amortizer.to(device=v.device))
 
         return self._get_params(name, prior)
