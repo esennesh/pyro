@@ -453,12 +453,16 @@ class AutoRegressiveMessenger(AutoMessenger):
         )
         return self._get_params(name, prior)
 
-class AutoSviMessenger(AutoMessenger):
+class AsviGuideMessenger(GuideMessenger):
+    def __init__(self, model: Callable, guide: PyroModule):
+        super().__init__(model)
+        self.guide = guide
+
     def _get_params(self, name: str, prior: Distribution):
         try:
-            prior_logits = deep_getattr(self.prior_logits, name)
-            mean_fields = {deep_getattr(self.mean_fields, name + "." + k) for
-                           k, v in dist_params(prior).items()}
+            prior_logits = deep_getattr(self.guide.prior_logits, name)
+            mean_fields = {deep_getattr(self.guide.mean_fields, name + "." + k)
+                           for k, v in dist_params(prior).items()}
             return prior_logits, mean_fields
         except AttributeError:
             pass
@@ -470,13 +474,15 @@ class AutoSviMessenger(AutoMessenger):
                 event_dim = transform.domain.event_dim
                 unconstrained = torch.zeros_like(v)
                 unconstrained = self._adjust_plates(unconstrained, event_dim)
-            deep_setattr(self, "mean_fields." + name + "." + k,
+            deep_setattr(self, "guide.mean_fields." + name + "." + k,
                          PyroParam(unconstrained, event_dim=event_dim))
         with torch.no_grad():
             event_dim_start = len(v.size()) - len(prior.event_shape)
-            prior_logits = torch.zeros(v.shape[:event_dim_start], device=v.device)
+            prior_logits = torch.zeros(v.shape[:event_dim_start],
+                                       device=v.device)
             prior_logits = self._adjust_plates(prior_logits, event_dim)
-        deep_setattr(self, "prior_logits." + name, PyroParam(prior_logits))
+        deep_setattr(self, "guide.prior_logits." + name,
+                     PyroParam(prior_logits))
 
         return self._get_params(name, prior)
 
@@ -505,21 +511,31 @@ class AutoSviMessenger(AutoMessenger):
                                                  [transform.with_cache()])
         return posterior
 
-class AutoNeuralSviMessenger(AutoSviMessenger):
+class AutoAsviMessenger(AutoMessenger,AsviGuideMessenger):
     def __init__(
         self,
         model: Callable,
-        obs_name: str,
-        batch_shape: torch.Size,
         *,
-        init_amortizer: Callable = mlp_amortizer,
         amortized_plates: Tuple[str, ...] = (),
     ):
+        AutoMessenger.__init__(self, model, amortized_plates=amortized_plates)
+        AsviGuideMessenger.__init__(self, self)
+
+class NeuralAsviGuideMessenger(AsviGuideMessenger):
+    def __init__(
+        self,
+        model: Callable,
+        guide: PyroModule,
+        obs_name: str,
+        event_shape: torch.Size,
+        *,
+        init_amortizer: Callable = mlp_amortizer,
+    ):
+        AsviGuideMessenger.__init__(self, model, guide)
         if not callable(init_amortizer):
             raise ValueError("Expected callable to construct ASVI amortizers")
-        super().__init__(model, amortized_plates=amortized_plates)
         self._obs_name = obs_name
-        self._batch_shape = batch_shape
+        self._event_shape = event_shape
         self._init_amortizer = init_amortizer
 
     def _get_params(self, name: str, prior: Distribution):
@@ -529,14 +545,14 @@ class AutoNeuralSviMessenger(AutoSviMessenger):
             data = data | condition
         try:
             obs = data[self._obs_name]
-            event_dim = _product(obs.shape[len(self._batch_shape):])
+            batch_shape = obs.shape[:-len(self._event_shape)]
         except KeyError:
             raise KeyError("Expected observation %s on which to condition amortized ASVI" % self._obs_name)
 
         try:
-            obs = obs.view(*self._batch_shape, event_dim)
-            prior_logits = deep_getattr(self.prior_logits, name)(obs).squeeze()
-            mean_fields = {k: deep_getattr(self.mean_fields, name + "." + k)(obs)
+            obs = obs.view(*batch_shape, *self._event_shape)
+            prior_logits = deep_getattr(self.guide.prior_logits, name)(obs).squeeze()
+            mean_fields = {k: deep_getattr(self.guide.mean_fields, name + "." + k)(obs)
                            for k, v in dist_params(prior).items()}
             return prior_logits, mean_fields
         except AttributeError:
@@ -544,11 +560,30 @@ class AutoNeuralSviMessenger(AutoSviMessenger):
 
         # Initialize amortizer nets
         for k, v in dist_params(prior).items():
-            amortizer = self._init_amortizer(event_dim,
-                                             _product(v.shape[len(self._batch_shape):]))
-            deep_setattr(self, "mean_fields." + name + "." + k,
+            v_dim = _product(v.shape[len(batch_shape):])
+            amortizer = self._init_amortizer(_product(self._event_shape), v_dim)
+            deep_setattr(self, "guide.mean_fields." + name + "." + k,
                          amortizer.to(device=v.device))
-        amortizer = self._init_amortizer(event_dim, 1)
-        deep_setattr(self, "prior_logits." + name, amortizer.to(device=v.device))
+        amortizer = self._init_amortizer(_product(self._event_shape), 1)
+        deep_setattr(self, "guide.prior_logits." + name,
+                     amortizer.to(device=v.device))
 
         return self._get_params(name, prior)
+
+class AutoNeuralAsviMessenger(AutoMessenger,NeuralAsviGuideMessenger):
+    def __init__(
+        self,
+        model: Callable,
+        obs_name: str,
+        event_shape: torch.Size,
+        *,
+        init_amortizer: Callable = mlp_amortizer,
+        amortized_plates: Tuple[str, ...] = (),
+    ):
+        if not callable(init_amortizer):
+            raise ValueError("Expected callable to construct ASVI amortizers")
+        super(AutoMessenger, self).__init__(model,
+                                            amortized_plates=amortized_plates)
+        super(NeuralAsviGuideMessenger, self).__init__(
+            self, obs_name, event_shape, init_amortizer=init_amortizer
+        )
