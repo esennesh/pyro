@@ -8,9 +8,6 @@ from pyro import poutine
 from pyro.distributions.distribution import Distribution
 from pyro.nn.module import PyroModule
 
-def dist_params(dist: Distribution):
-    return {k: v for k, v in dist.__dict__.items() if k[0] != '_'}
-
 def _product(shape):
     """
     Computes the product of the dimensions of a given shape tensor
@@ -19,7 +16,6 @@ def _product(shape):
     for size in shape:
         result *= size
     return result
-
 
 def deep_getattr(obj, key):
     for part in key.split("."):

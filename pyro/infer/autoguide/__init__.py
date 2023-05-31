@@ -2,14 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from pyro.infer.autoguide.effect import (
-    AsviGuideMessenger,
     AutoHierarchicalNormalMessenger,
     AutoMessenger,
     AutoNormalMessenger,
-    AutoNeuralAsviMessenger,
     AutoRegressiveMessenger,
-    AutoAsviMessenger,
-    NeuralAsviGuideMessenger,
 )
 from pyro.infer.autoguide.gaussian import AutoGaussian
 from pyro.infer.autoguide.guides import (
@@ -40,8 +36,6 @@ from pyro.infer.autoguide.structured import AutoStructured
 from pyro.infer.autoguide.utils import mean_field_entropy
 
 __all__ = [
-    "AsviGuideMessenger",
-    "AutoAsviMessenger",
     "AutoCallable",
     "AutoContinuous",
     "AutoDelta",
@@ -59,10 +53,8 @@ __all__ = [
     "AutoNormalMessenger",
     "AutoHierarchicalNormalMessenger",
     "AutoNormalizingFlow",
-    "AutoNeuralAsviMessenger",
     "AutoRegressiveMessenger",
     "AutoStructured",
-    "NeuralAsviGuideMessenger",
     "init_to_feasible",
     "init_to_generated",
     "init_to_mean",
