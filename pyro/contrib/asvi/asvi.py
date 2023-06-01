@@ -10,44 +10,65 @@ import pyro.distributions as dist
 from pyro.distributions.distribution import Distribution
 from pyro.infer.autoguide.utils import deep_getattr, deep_setattr, helpful_support_errors, _product
 from pyro.nn.module import PyroModule, PyroParam
-from pyro.poutine.guide import GuideMessenger
 from pyro.poutine.handlers import _make_handler
-from pyro.poutine.runtime import get_conditions
+from pyro.poutine.trace_messenger import TraceMessenger
+from pyro.poutine.util import site_is_subsample
 
 from .util import dist_params, mlp_amortizer
 
-class AsviMessenger(GuideMessenger):
-    def __init__(self, model: Callable, module: PyroModule):
-        super().__init__(model)
-        self.module = module
+class AsviMessenger(TraceMessenger):
+    def __init__(
+        self,
+        amortizer: PyroModule,
+        data: torch.Tensor,
+        event_shape: torch.Size,
+        *args,
+        init_amortizer: Callable = mlp_amortizer,
+    ):
+        super().__init__()
+        if not isinstance(amortizer, PyroModule):
+            raise ValueError("Expected PyroModule for ASVI amortization")
+        self._amortizer = (amortizer,)
+        if not isinstance(data, torch.Tensor):
+            raise ValueError("Expected tensor for ASVI conditioning")
+        try:
+            obs = data.view(-1, *event_shape)
+        except:
+            raise ValueError("Expected batch_shape + event_shape but found data shape %s" % data.shape)
+        self.data = data
+        self._event_shape = event_shape
+        if not callable(init_amortizer):
+            raise ValueError("Expected callable to construct ASVI amortizers")
+        self._init_amortizer = init_amortizer
+
+    @property
+    def amortizer(self):
+        return self._amortizer[0]
 
     def _get_params(self, name: str, prior: Distribution):
+        batch_shape = self.data.shape[:-len(self._event_shape)]
         try:
-            prior_logits = deep_getattr(self.module.prior_logits, name)
-            mean_fields = {deep_getattr(self.module.mean_fields, name + "." + k)
-                           for k, v in dist_params(prior).items()}
+            prior_logits = deep_getattr(self.amortizer.prior_logits, name)
+            prior_logits = prior_logits(self.data).squeeze()
+            mean_fields = {}
+            for k in dist_params(prior):
+                mean_field_amortizer = deep_getattr(self.amortizer.mean_fields,
+                                                    name + "." + k)
+                mean_fields[k] = mean_field_amortizer(self.data)
             return prior_logits, mean_fields
         except AttributeError:
-            pass
+            # Initialize amortizer nets
+            for k, v in dist_params(prior).items():
+                v_dim = _product(v.shape[len(batch_shape):])
+                amortizer = self._init_amortizer(_product(self._event_shape),
+                                                 v_dim)
+                deep_setattr(self, "amortizer.mean_fields." + name + "." + k,
+                             amortizer.to(device=v.device))
+            amortizer = self._init_amortizer(_product(self._event_shape), 1)
+            deep_setattr(self, "amortizer.prior_logits." + name,
+                         amortizer.to(device=v.device))
 
-        # Initialize
-        for k, v in dist_params(prior).items():
-            with torch.no_grad():
-                transform = biject_to(prior.support)
-                event_dim = transform.domain.event_dim
-                unconstrained = torch.zeros_like(v)
-                unconstrained = self._adjust_plates(unconstrained, event_dim)
-            deep_setattr(self, "module.mean_fields." + name + "." + k,
-                         PyroParam(unconstrained, event_dim=event_dim))
-        with torch.no_grad():
-            event_dim_start = len(v.size()) - len(prior.event_shape)
-            prior_logits = torch.zeros(v.shape[:event_dim_start],
-                                       device=v.device)
-            prior_logits = self._adjust_plates(prior_logits, event_dim)
-        deep_setattr(self, "module.prior_logits." + name,
-                     PyroParam(prior_logits))
-
-        return self._get_params(name, prior)
+            return self._get_params(name, prior)
 
     def get_posterior(self, name: str, prior: Distribution) -> Distribution:
         with helpful_support_errors({"name": name, "fn": prior}):
@@ -74,58 +95,28 @@ class AsviMessenger(GuideMessenger):
                                                  [transform.with_cache()])
         return posterior
 
-class NeuralAsviMessenger(AsviMessenger):
-    def __init__(
-        self,
-        model: Callable,
-        module: PyroModule,
-        obs_name: str,
-        event_shape: torch.Size,
-        *,
-        init_amortizer: Callable = mlp_amortizer,
-    ):
-        AsviMessenger.__init__(self, model, module)
-        if not callable(init_amortizer):
-            raise ValueError("Expected callable to construct ASVI amortizers")
-        self._obs_name = obs_name
-        self._event_shape = event_shape
-        self._init_amortizer = init_amortizer
+    def _pyro_sample(self, msg):
+        if msg["is_observed"] or site_is_subsample(msg):
+            return
+        prior = msg["fn"]
+        msg["infer"]["prior"] = prior
+        posterior = self.get_posterior(msg["name"], prior)
+        if isinstance(posterior, torch.Tensor):
+            posterior = dist.Delta(posterior, event_dim=prior.event_dim)
+        if posterior.batch_shape != prior.batch_shape:
+            posterior = posterior.expand(prior.batch_shape)
+        msg["fn"] = posterior
 
-    def _get_params(self, name: str, prior: Distribution):
-        conditions = get_conditions()
-        data = {}
-        for condition in conditions:
-            data = data | condition
-        try:
-            obs = data[self._obs_name]
-            batch_shape = obs.shape[:-len(self._event_shape)]
-        except KeyError:
-            raise KeyError("Expected observation %s on which to condition amortized ASVI" % self._obs_name)
-
-        try:
-            obs = obs.view(*batch_shape, *self._event_shape)
-            prior_logits = deep_getattr(self.module.prior_logits, name)(obs).squeeze()
-            mean_fields = {k: deep_getattr(self.module.mean_fields, name + "." + k)(obs)
-                           for k, v in dist_params(prior).items()}
-            return prior_logits, mean_fields
-        except AttributeError:
-            pass
-
-        # Initialize amortizer nets
-        for k, v in dist_params(prior).items():
-            v_dim = _product(v.shape[len(batch_shape):])
-            amortizer = self._init_amortizer(_product(self._event_shape), v_dim)
-            deep_setattr(self, "module.mean_fields." + name + "." + k,
-                         amortizer.to(device=v.device))
-        amortizer = self._init_amortizer(_product(self._event_shape), 1)
-        deep_setattr(self, "module.prior_logits." + name,
-                     amortizer.to(device=v.device))
-
-        return self._get_params(name, prior)
+    def _pyro_post_sample(self, msg):
+        # Manually apply outer plates.
+        prior = msg["infer"].get("prior")
+        if prior is not None and prior.batch_shape != msg["fn"].batch_shape:
+            msg["infer"]["prior"] = prior.expand(msg["fn"].batch_shape)
+        return super()._pyro_post_sample(msg)
 
 _msngrs = [
     AsviMessenger,
-    NeuralAsviMessenger,
+#    NeuralAsviMessenger,
 ]
 
 for _msngr_cls in _msngrs:

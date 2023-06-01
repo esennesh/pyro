@@ -7,24 +7,15 @@ import torch
 
 from pyro.infer.autoguide import AutoMessenger
 
-from .asvi import AsviMessenger, NeuralAsviMessenger
+# from .asvi import AsviMessenger, NeuralAsviMessenger
+from .asvi import AsviMessenger
 from .util import mlp_amortizer
 
 class AutoAsviMessenger(AutoMessenger,AsviMessenger):
     def __init__(
         self,
         model: Callable,
-        *,
-        amortized_plates: Tuple[str, ...] = (),
-    ):
-        AutoMessenger.__init__(self, model, amortized_plates=amortized_plates)
-        AsviMessenger.__init__(self, self)
-
-class AutoNeuralAsviMessenger(AutoMessenger,NeuralAsviMessenger):
-    def __init__(
-        self,
-        model: Callable,
-        obs_name: str,
+        data: torch.Tensor,
         event_shape: torch.Size,
         *,
         init_amortizer: Callable = mlp_amortizer,
@@ -35,5 +26,5 @@ class AutoNeuralAsviMessenger(AutoMessenger,NeuralAsviMessenger):
         super(AutoMessenger, self).__init__(model,
                                             amortized_plates=amortized_plates)
         super(NeuralAsviMessenger, self).__init__(
-            self, obs_name, event_shape, init_amortizer=init_amortizer
+            self, data, event_shape, init_amortizer=init_amortizer
         )
