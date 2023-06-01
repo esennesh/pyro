@@ -344,19 +344,3 @@ def get_plates() -> tuple:
     :rtype: tuple
     """
     return _inspect()["cond_indep_stack"]
-
-def get_conditions() -> tuple:
-    """
-    Records the effects of enclosing ``pyro.condition`` contexts.
-
-    :returns: A tuple of :class:`dict` objects
-    :rtype: tuple
-    """
-    conditions = ()
-    stack = _PYRO_STACK
-
-    for frame in stack:
-        if hasattr(frame, 'data'):
-            conditions = conditions + (frame.data,)
-
-    return conditions
